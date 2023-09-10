@@ -72,13 +72,16 @@ def main():
     users_vitrina_df = act_city_df.join(df_home_city, "user_id", "left")
 
     # Вычисление количества посещенных городов и списка городов в порядке посещения для каждого пользователя
-    window_spec2 = Window.partitionBy('user_id').orderBy('event.datetime')
-    df = df.withColumn('visit_number', F.row_number().over(window_spec2))
-    df_travel_array = df.groupBy('user_id').agg(F.collect_list('city').alias('travel_array'))
-    df_travel_count = df_travel_array.withColumn('travel_count', F.size('travel_array'))
+    window_spec2 = Window.partitionBy('event.user').orderBy('event.datetime')
+    df_with_window = df.withColumn('lag_city', F.lag('city').over(window_spec2))
+    df_with_window = df_with_window.withColumn('lead_city', F.lead('city').over(window_spec2))
+    df_border_cities = df_with_window.filter((df_with_window['lag_city'] != df_with_window['city']) | (df_with_window['lead_city'] != df_with_window['city']))
+    df_travel_count = df_border_cities.groupBy(F.col('event.user').alias('user_id')).agg(F.count('*').alias('travel_count'))
+    df_travel_array = df_border_cities.groupBy(F.col('event.user').alias('user_id')).agg(F.collect_list('city').alias('travel_array'))
 
     # Присоединяем столбцы df_travel_array и df_travel_count к итоговой витрине
-    users_vitrina_df = users_vitrina_df.join(df_travel_count, 'user_id', 'left')
+    users_vitrina_df = users_vitrina_df.join(df_travel_count, 'user_id', 'left') \
+                                   .join(df_travel_array, 'user_id', 'left')
     
     # Вычисление местного времени для каждого пользователя
     local_time_df = act_city_df.join(events_df.select(F.col('event.user').alias('user_id'), 
