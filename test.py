@@ -9,6 +9,7 @@ findspark.find()
 import pyspark
 from pyspark.sql import SparkSession
 import pyspark.sql.functions as F
+from pyspark.sql.window import Window
 from datetime import datetime
 from pyspark.sql.types import StructType, StructField, StringType, IntegerType, FloatType, ArrayType
 
@@ -42,3 +43,4 @@ geo_df = change_dec_sep(geo_df, 'lng')
 
 # Входные данные
 events_df = spark.read.parquet(base_path)
+

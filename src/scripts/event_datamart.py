@@ -54,19 +54,22 @@ def main():
 
     df = df.select('event', 'event_type', 'zone_id', 'city', 'distance')
     df = df.join(df.select('event', 'distance').groupBy('event').agg(F.min('distance')), 'event')
+    df = df.filter((F.col('distance') == F.col('min(distance)')) & (F.col('event.user').isNotNull())) 
 
     # Определение актуального адреса (города) для каждого пользователя
-    act_city_df = df.filter((F.col('distance') == F.col('min(distance)')) & (F.col('event.user').isNotNull())) \
-                .select(F.col('event.user').alias('user_id'), F.col('city').alias('act_city'))
+    windowSpec = Window.partitionBy("event.user").orderBy(F.desc("event.datetime"))
+    df = df.withColumn("row_number", F.row_number().over(windowSpec))
+    act_city_df = df.filter(df.row_number == 1).select(F.col('event.user').alias('user_id'), 'city')
+    df = df.drop("row_number")
 
     # Определение домашнего адреса (города) для каждого пользователя
-    window_spec = Window.partitionBy('event.user').orderBy('event.datetime')
+    window_spec = Window.partitionBy('event.user').orderBy(F.col('event.datetime').desc())
     df = df.withColumn('prev_city', F.lag('city').over(window_spec))
     df = df.filter(df['city'] != df['prev_city'])
     df = df.withColumn('prev_date', F.lag('event.datetime').over(window_spec))
     df = df.withColumn('days_since_prev_change', F.datediff(F.col('event.datetime'), F.col('prev_date')))
     df_filtered = df.filter(df['days_since_prev_change'] >= 27)
-    df_home_city = df_filtered.groupBy(F.col('event.user').alias('user_id')).agg(F.last('city').alias('home_city'))
+    df_home_city = df_filtered.withColumn('rank', F.row_number().over(window_spec)).filter(F.col('rank') == 1).select(F.col('event.user').alias('user_id'), F.col('city').alias('home_city'))
 
     # Создание витрины пользователей
     users_vitrina_df = act_city_df.join(df_home_city, "user_id", "left")

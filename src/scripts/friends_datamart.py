@@ -36,8 +36,6 @@ def main():
 
     # Читаем фрейм с событиями и их координатами
     events_df = sql.read.parquet(f'{path_to_geo_events}/date={date}')
-    
-    events_df = events_df.select(F.col('event'), F.col('event_type'), F.col('event.user').alias('user_id'), 'lat', 'lon').where(F.col('lat').isNotNull() & F.col('lon').isNotNull())
 
     df = events_df.crossJoin(geo_df.select(F.col('id').alias('zone_id'), 
                                         F.col('city'), 
@@ -50,64 +48,61 @@ def main():
                                     + F.cos(F.radians(F.col('lat'))) * F.cos(F.radians(F.col('lat_city'))) 
                                     * F.pow(F.sin((F.radians(F.col('lon')) - F.radians(F.col('lon_city')))/F.lit(2)), 2))))
 
+    df = df.select('event', 'event_type', 'zone_id', 'city', 'timezone', 'lat', 'lon', 'distance')\
+           .filter(F.col('lat').isNotNull() & F.col('lon').isNotNull()) 
+
     df = df.join(df.select('event', 'distance').groupBy('event').agg(F.min('distance')), 'event')
+    df = df.filter((F.col('distance') == F.col('min(distance)')) & (F.col('event.user').isNotNull())) 
 
-    df = df.where(F.col('distance') == F.col('min(distance)'))
+    # Находим список пользователей, подписанных на один и тот же канал
+    same_channel_users = df.select('event.subscription_channel', F.col('event.user').alias('user_left'))\
+                .filter(df.event.subscription_channel.isNotNull() & df.event.user.isNotNull())
 
-    # Найдем пользователей, которые не переписывались друг с другом
-    users_interacted = df.select("event.message_from", "event.message_to")
-    users_interacted = users_interacted.filter(users_interacted.message_from.isNotNull() & users_interacted.message_to.isNotNull())
-    users_interacted = users_interacted.withColumn("user_pair", F.array(users_interacted.message_from, users_interacted.message_to))
-    users_interacted = users_interacted.groupBy("user_pair").agg(F.count("*").alias("interaction_count"))
-    users_interacted = users_interacted.filter(users_interacted.interaction_count < 1)
-    users_interacted = users_interacted.withColumn("user_left", users_interacted.user_pair[0].cast("string")).withColumn("user_right", users_interacted.user_pair[1].cast("string"))
-    users_interacted = users_interacted.select('user_left', 'user_right')
+    same_channel_users = same_channel_users.join(same_channel_users.select('subscription_channel', F.col('user_left').alias('user_right')), 'subscription_channel')
+    same_channel_users = same_channel_users.filter(same_channel_users.user_left != same_channel_users.user_right)
 
-    # Найдем пользователей, которые состоят в одном канале
-    user_sub = df.select('event.subscription_channel', 'event.user').filter(df.event.subscription_channel.isNotNull() &
-                                                                        df.event.user.isNotNull())
+    # Находим пользователей, которые уже переписывались друг с другом
+    interacted_users = df.groupBy("event.message_from", "event.message_to").count().filter(F.col("count") > 1).select(
+        F.col("message_from").alias("user_left"),
+        F.col("message_to").alias("user_right")
+    )
 
-    users_recommendation = users_interacted.join(user_sub, users_interacted.user_left == user_sub.user, "left") \
-                .withColumn("ul_channel", F.col("subscription_channel")) \
-                .drop("subscription_channel", "user") \
-                .join(user_sub, users_interacted.user_right == user_sub.user, "left") \
-                .withColumnRenamed("subscription_channel", "ur_channel") \
-                .drop("user")
-
-
-    users_recommendation = users_recommendation.select('user_left', 'user_right').filter(users_recommendation.ul_channel == users_recommendation.ur_channel)
+    # Убираем пользователей из списка 
+    recommended_users = same_channel_users.join(interacted_users,
+                                                (same_channel_users["user_left"].contains(interacted_users["user_left"])) &
+                                                (same_channel_users["user_right"].contains(interacted_users["user_right"])),
+                                                "leftanti")
 
     # Найдем пользователей, которые находятся на расстоянии 1 км друг от друга
+    window_spec = Window.partitionBy('event.user').orderBy(F.col('event.datetime').desc())
+    user_geo = df.withColumn('rank', F.row_number().over(window_spec)).filter(F.col('rank') == 1).select('event.user', 'lat', 'lon')
 
-    user_geo = df.select('event.user', 'lat', 'lon')
-
-    joined_df = users_recommendation.join(user_geo.select('user', F.col('lat').alias('ul_lat'), F.col('lon').alias('ul_lon')), 
-                                        users_recommendation.user_left == user_geo.user, "left") \
-                                    .join(user_geo.select('user', F.col('lat').alias('ur_lat'), F.col('lon').alias('ur_lon')), 
-                                        users_recommendation.user_right == user_geo.user, "left")
+    joined_df = recommended_users.join(user_geo.select('user', F.col('lat').alias('ul_lat'), F.col('lon').alias('ul_lon')), 
+                                            recommended_users.user_left == user_geo.user, "left") \
+                                        .join(user_geo.select('user', F.col('lat').alias('ur_lat'), F.col('lon').alias('ur_lon')), 
+                                            recommended_users.user_right == user_geo.user, "left")
 
     joined_df = joined_df.withColumn("distance", F.lit(2) * F.lit(6371) 
-                                    * F.asin(F.sqrt(F.pow(F.sin((F.radians(F.col('ul_lat')) - F.radians(F.col('ur_lat')))/F.lit(2)), 2) 
-                                        + F.cos(F.radians(F.col('ul_lat'))) * F.cos(F.radians(F.col('ur_lat'))) 
-                                        * F.pow(F.sin((F.radians(F.col('ul_lon')) - F.radians(F.col('ur_lon')))/F.lit(2)), 2))))
+                                        * F.asin(F.sqrt(F.pow(F.sin((F.radians(F.col('ul_lat')) - F.radians(F.col('ur_lat')))/F.lit(2)), 2) 
+                                            + F.cos(F.radians(F.col('ul_lat'))) * F.cos(F.radians(F.col('ur_lat'))) 
+                                            * F.pow(F.sin((F.radians(F.col('ul_lon')) - F.radians(F.col('ur_lon')))/F.lit(2)), 2))))
 
-    users_recommendation = joined_df.select('user_left', 'user_right').filter(F.col('distance') <= 1)
+    recommended_users = joined_df.select('user_left', 'user_right').filter(F.col('distance') <= 1)
 
     # Добавление атрибутов витрины
-    users_recommendation = users_recommendation.withColumn("processed_dttm", F.current_timestamp())
+    recommended_users = recommended_users.withColumn("processed_dttm", F.current_timestamp())
 
     user_zone = df.select('event.user',  'zone_id') 
-    users_recommendation = users_recommendation.join(user_zone, F.col("user_left") == F.col("user"), "left") \
-                                            .drop('user')
+    recommended_users = recommended_users.join(user_zone, F.col("user_left") == F.col("user"), "left").drop('user')
 
 
     local_time_df = df.select('zone_id', 'timezone', F.date_format('event.datetime', "HH:mm:ss").alias('time_utc'))
-    users_recommendation = users_recommendation.join(local_time_df, users_recommendation.zone_id == local_time_df.zone_id)
-    users_recommendation = users_recommendation.withColumn("local_time", F.from_utc_timestamp(F.col("time_utc"), F.col("timezone"))) \
-                                            .drop('local_time_df.zone_id', 'timezone', 'time_utc')
+    recommended_users = recommended_users.join(local_time_df, recommended_users.zone_id == local_time_df.zone_id)
+    recommended_users = recommended_users.withColumn("local_time", F.from_utc_timestamp(F.col("time_utc"), F.col("timezone")))\
+                                                .drop('local_time_df.zone_id', 'timezone', 'time_utc')
 
     # Вывод результата
-    users_recommendation.write.mode("overwrite").parquet(f"{output_base_path}/date={date}")
+    recommended_users.write.mode("overwrite").parquet(f"{output_base_path}/date={date}")
 
 if __name__ == "__main__":
     main()
